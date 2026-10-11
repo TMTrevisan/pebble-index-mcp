@@ -1,157 +1,149 @@
-# muse — Pebble Index 01 MCP bridge
+# pebble-index-mcp — Pebble Index 01 MCP Bridge
 
-Lets Todd talk to Muse through his Pebble Index 01 smart ring. Voice goes
+Talk to your own AI assistant through a Pebble Index 01 smart ring. Voice goes
 ring → Pebble app → Pebble cloud agent → this server's tools, and the answer
 comes back as a phone notification.
 
-Three tools:
+Three tools ship out of the box:
 
 | Tool | What it does |
 |---|---|
-| `ha` | Home Assistant over the local REST API — lights, switches, fans, climate (including "set the thermostat to 72"), covers, media players, sensor reads. Never touches locks or alarms. |
-| `wyze` | On/off for exactly two lights: "Todd's light" (bedroom) and "Lamp" (living room). Nothing else on the Wyze account. |
-| `ask_muse` | Anything else — the question is queued for Muse himself, who answers over an HTTPS bridge (`GET /queue/pending` + `POST /queue/answer`). See "How ask_muse reaches Muse" below. |
+| `ha` | Home Assistant over the local REST API — lights, switches, fans, climate, covers, media players, sensor reads. Never touches locks or alarms. |
+| `wyze` | On/off for Wyze lights. **You must configure which lights** (see below) — by default it controls nothing until you set it up. |
+| `ask_muse` | Anything else — the question is queued for your assistant, who answers over an HTTPS bridge (`GET /queue/pending` + `POST /queue/answer`). See "How ask_muse works" below. |
 
-## Run it (on the Home Assistant box)
+## What you need
 
-This is built for Todd's Home Assistant OS machine (Pi 4), deployed through
-the **Portainer add-on** (already installed).
+- A Pebble Index 01 smart ring + the Pebble mobile app
+- A Docker host on your home network (Synology NAS, Raspberry Pi, any Linux box)
+- Home Assistant (optional — only needed for the `ha` tool)
+- A Wyze account with lights (optional — only needed for the `wyze` tool)
+- A public HTTPS URL for the server (DuckDNS + reverse proxy, Cloudflare Tunnel, etc.)
+- Your AI assistant with the ability to poll an HTTPS endpoint (for `ask_muse`)
 
-### Deploy via Portainer (recommended)
+## Quick start
 
-1. Portainer → **Stacks** → **Add stack** → give it a name (e.g. `muse`).
-2. Build method: **Repository**.
-   - Repository URL: `https://github.com/TMTrevisan/pebble-index-mcp.git`
-   - Reference: `refs/heads/pi-bridge`
-   - Compose path: `docker-compose.yml`
-3. **Environment variables** → Add each of these (values from below):
-   `MCP_BEARER_TOKEN`, `HASS_TOKEN`, `WYZE_EMAIL`, `WYZE_PASSWORD`,
-   `WYZE_KEY_ID`, `WYZE_API_KEY`, `MCP_ALLOWED_HOSTS`
-4. **Deploy the stack.** Portainer clones the repo, builds the image, and
-   starts the container on `:8765`.
-
-To update later: Stacks → `muse` → **Pull and redeploy** (or change the
-reference to a newer branch).
-
-### Or via docker compose on any Docker host on the home network
+### 1. Clone and configure
 
 ```bash
 git clone -b pi-bridge https://github.com/TMTrevisan/pebble-index-mcp.git
 cd pebble-index-mcp
 cp .env.example .env && chmod 600 .env
-# fill in .env (see below), then:
+```
+
+Fill in `.env` (see "Environment variables" below).
+
+### 2. Deploy with Docker Compose
+
+```yaml
+services:
+  muse:
+    container_name: muse-pebble-mcp
+    image: acisco2/pebble-index-mcp:pi-bridge
+    restart: unless-stopped
+    ports:
+      - 8765:8765
+    environment:
+      - MCP_BEARER_TOKEN=${MCP_BEARER_TOKEN}
+      - HASS_TOKEN=${HASS_TOKEN}
+      - HASS_URL=${HASS_URL}
+      - WYZE_EMAIL=${WYZE_EMAIL}
+      - WYZE_PASSWORD=${WYZE_PASSWORD}
+      - WYZE_KEY_ID=${WYZE_KEY_ID}
+      - WYZE_API_KEY=${WYZE_API_KEY}
+      - MCP_ALLOWED_HOSTS=${MCP_ALLOWED_HOSTS}
+```
+
+```bash
 docker compose up -d
 ```
 
-The server listens on `:8765` and probes for Home Assistant at
-`http://homeassistant:8123` (then `localhost:8123`, then
-`host.docker.internal:8123`). Set `HASS_URL` explicitly if needed.
+The server listens on `:8765`.
 
-### 1. Home Assistant token
+### 3. Environment variables
 
-HA → click your profile (bottom-left) → **Long-Lived Access Tokens** →
-Create Token. Paste it as `HASS_TOKEN` in `.env`. The server talks to HA
-over the local network — no cloud round-trip.
+| Variable | Required | Description |
+|---|---|---|
+| `MCP_BEARER_TOKEN` | Yes | Auth token for the Pebble app. Generate with `openssl rand -hex 32`. |
+| `MCP_ALLOWED_HOSTS` | Yes | Your public hostname (e.g. `myhome.duckdns.org`). DNS-rebinding protection. |
+| `HASS_URL` | For `ha` | Home Assistant URL (e.g. `http://192.168.1.100:8123`). |
+| `HASS_TOKEN` | For `ha` | HA long-lived access token (Profile → Long-Lived Access Tokens). |
+| `WYZE_EMAIL` | For `wyze` | Wyze account email. |
+| `WYZE_PASSWORD` | For `wyze` | Wyze account password. |
+| `WYZE_KEY_ID` | For `wyze` | Wyze API key ID. |
+| `WYZE_API_KEY` | For `wyze` | Wyze API key. |
 
-### 2. Wyze credentials (for the `wyze` tool)
+### 4. Expose via HTTPS
 
-`WYZE_EMAIL`, `WYZE_PASSWORD`, `WYZE_KEY_ID`, `WYZE_API_KEY` in `.env`.
-Without them, `wyze` says it isn't set up; everything else works.
-
-### 3. Bearer token (Pebble app → server auth)
-
-Generate one and put it in `.env`:
-
-```bash
-openssl rand -hex 32
-```
-
-Every request without `Authorization: Bearer <token>` gets a 401.
-
-### 4. Expose it through the existing DuckDNS + HTTPS setup
-
-The Pebble app needs a public `https://` URL ending in `/mcp`. Two options:
-
-**A. NGINX Home Assistant SSL proxy add-on (recommended — already installed).**
-Add a location to the existing proxy config:
+The Pebble app requires a public `https://` URL ending in `/mcp`. Add these to your reverse proxy (NGINX, etc.):
 
 ```nginx
 location /mcp {
-    proxy_pass http://<container-ip-or-hostname>:8765;
+    proxy_pass http://<server-ip>:8765;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header Authorization $http_authorization;
 }
-# The ask_muse bridge: lets Muse's cron poll for ring questions and post
-# answers back. Same auth as /mcp.
 location /queue/ {
-    proxy_pass http://<container-ip-or-hostname>:8765;
+    proxy_pass http://<server-ip>:8765;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header Authorization $http_authorization;
 }
 ```
 
-Then the MCP URL is `https://<your-duckdns-host>/mcp`.
+Your MCP URL will be `https://<your-host>/mcp`.
 
-**B. New port forward.** Forward an external port to the box's 8765 and
-terminate TLS in front of it (the app requires HTTPS).
-
-Also add your public hostname to `MCP_ALLOWED_HOSTS` in `.env`
-(e.g. `MCP_ALLOWED_HOSTS=petitcasa.duckdns.org`) — the server rejects
-requests whose Host header isn't allowlisted (DNS-rebinding protection).
-
-## Phone setup (Pebble app)
+### 5. Phone setup (Pebble app)
 
 1. Index tab → **MCP Settings** → Groups → create a sandbox group.
-   - **Model type: `Default`** — the `Index Agent` type ignores custom MCP
-     servers. This is the gotcha that bites everyone.
+   - **Model type: `Default`** — the `Index Agent` type ignores custom MCP servers.
 2. **MCP Servers** tab → Add HTTP MCP Server:
-   - **Name:** `muse` (no spaces — spaces break tool routing)
-   - **URL:** `https://<your-duckdns-host>/mcp`
+   - **Name:** no spaces (e.g. `muse`)
+   - **URL:** `https://<your-host>/mcp`
    - **Type:** **Streamable** (not SSE)
-   - **Authorization:** literally `Bearer <your-token>` — the `Bearer `
-     prefix is REQUIRED; the raw token alone 401s on every request
+   - **Authorization:** literally `Bearer <your-token>` — the `Bearer ` prefix is REQUIRED
    - **Group:** the sandbox group from step 1
-3. In the server's settings, select the `ring_persona` prompt so it joins
-   the agent's system prompt.
+3. Select the `ring_persona` prompt for the server.
 4. Index settings → **"Double click and hold"** → assign the sandbox group.
-   Keep single click as the default Index agent for private offline notes.
 
-## How ask_muse reaches Muse
+## Customizing for your setup
 
-The `ask_muse` tool doesn't answer locally — it hands the question to Muse
-himself, who runs on a different machine:
+### Wyze lights
 
-1. The tool writes `queue/<id>.json` (`{"id", "question", "ts"}`) and waits
-   up to 150s for `queue/<id>.answer.json` to appear.
-2. Muse's cron polls `GET https://<your-duckdns-host>/queue/pending` with
-   `Authorization: Bearer <token>`. It returns the oldest unanswered question
-   (and marks it claimed so it isn't delivered twice), or 204 when empty.
-3. Muse answers and `POST`s `{"id", "answer"}` to `/queue/answer`, which
-   writes the answer file; the waiting tool picks it up and returns it
-   through the coreSchema contract.
-4. Both endpoints require the same bearer token (401 otherwise).
+The `wyze` tool is hardcoded to two example lights. To use your own:
 
-If no answer arrives in 150s the tool says so gracefully — ask in chat
-instead. Rough latency for a ring question is about a minute.
+1. Find your lights' MAC addresses (Wyze app → Device Info).
+2. Edit `src/pebble_index_mcp/server.py`:
+   - Update `WYZE_TODDS_MAC` and `WYZE_LAMP_MAC` (or rename them)
+   - Update the `wyze()` tool description and matching logic
+3. Rebuild the Docker image.
+
+### Home Assistant
+
+The `ha` tool works with any Home Assistant instance — just set `HASS_URL` and `HASS_TOKEN`. No code changes needed.
+
+### The `ask_muse` bridge
+
+This tool queues questions for your AI assistant to answer. Your assistant needs to:
+
+1. Poll `GET https://<your-host>/queue/pending` with `Authorization: Bearer <token>` (returns 204 when empty, or JSON with `{"id", "question"}`).
+2. POST the answer to `/queue/answer` with `{"id", "answer"}`.
+3. The waiting tool picks up the answer (up to 150s timeout) and returns it as a phone notification.
+
+See `bridge/queue.py` for a reference polling client.
 
 ## How replies get back to the phone
 
-No separate push setup needed. The Pebble app builds the completion
-notification from the **last tool result** — every tool returns the
-`coreSchema` Response contract, so the phone shows the *answer*, not the
-question. (A plain-text tool result would show the transcription instead.)
+No push setup needed. The Pebble app builds the completion notification from the **last tool result** — every tool returns the `coreSchema` Response contract, so the phone shows the *answer*, not the question.
 
 ## Security notes
 
 - Bearer token on every request (constant-time compare); 401 otherwise.
 - DNS-rebinding protection: only loopback + `MCP_ALLOWED_HOSTS` are served.
-- `.env` is git-ignored; the example ships empty. Secrets never appear in
-  logs — the server logs that a token is missing, never its value.
+- `.env` is git-ignored. Secrets never appear in logs.
 - The `ha` tool refuses anything matching lock/unlock/alarm/disarm.
-- The `wyze` tool can only address the two MACs in `WYZE_TODDS_MAC` /
-  `WYZE_LAMP_MAC`; similarly-named bulbs are scrubbed before matching.
+- The `wyze` tool only addresses configured MACs.
 
 ## For developers
 
@@ -159,9 +151,3 @@ question. (A plain-text tool result would show the transcription instead.)
 python3.11 -m venv .venv && .venv/bin/pip install -e ".[dev]"
 .venv/bin/python -m pytest tests/ -q
 ```
-
-`mcp==1.29.0` is pinned deliberately: `server.py` registers the
-`ring_persona` prompt on the low-level server so `prompts/list` emits
-`"arguments": null`, which the Pebble app's client requires (it hides
-prompts whose `arguments` is a non-null list). Bump only with
-`test_prompts_list_arguments_null` green.
