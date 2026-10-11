@@ -196,6 +196,7 @@ def ha(command: str) -> CallToolResult:
     in plain text. Handles lights, switches, fans, climate, covers/blinds,
     media players, and sensor/status reads. Returns a short spoken answer.
     Cannot touch locks or alarms from the ring."""
+    logger.info(f"HA called with command: {command!r}")
     try:
         c = command.lower()
         if any(k in c for k in _HA_DENY_WORDS):
@@ -241,6 +242,7 @@ def wyze(command: str) -> CallToolResult:
     (living room) — e.g. "turn off Todd's light", "Lamp on". These are the
     ONLY lights this tool may touch; similarly-named bulbs (Small Lamp,
     Office Lamp, etc.) are never valid targets."""
+    logger.info(f"WYZE called with command: {command!r}")
     try:
         c = command.lower()
         scrubbed = c
@@ -293,6 +295,7 @@ def ask_muse(question: str) -> CallToolResult:
     advice, current information, math, opinions, anything needing Todd's
     context or judgment. The question is handed to Muse himself and his
     answer comes back as the phone notification. Keep the question short."""
+    logger.info(f"ASK_MUSE called with question: {question!r}")
     _QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     qid = uuid.uuid4().hex
     qfile = _QUEUE_DIR / f"{qid}.json"
