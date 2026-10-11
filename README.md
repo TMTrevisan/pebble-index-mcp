@@ -14,12 +14,30 @@ Three tools:
 
 ## Run it (on the Home Assistant box)
 
-This is built for Todd's Home Assistant OS machine, deployed through the
-**Portainer add-on** (already installed) → **Stacks** → **Add stack**,
-paste the contents of `docker-compose.yml`, and add the environment
-variables below. Or on any Docker host on the home network:
+This is built for Todd's Home Assistant OS machine (Pi 4), deployed through
+the **Portainer add-on** (already installed).
+
+### Deploy via Portainer (recommended)
+
+1. Portainer → **Stacks** → **Add stack** → give it a name (e.g. `muse`).
+2. Build method: **Repository**.
+   - Repository URL: `https://github.com/TMTrevisan/pebble-index-mcp.git`
+   - Reference: `refs/heads/pi-bridge`
+   - Compose path: `docker-compose.yml`
+3. **Environment variables** → Add each of these (values from below):
+   `MCP_BEARER_TOKEN`, `HASS_TOKEN`, `WYZE_EMAIL`, `WYZE_PASSWORD`,
+   `WYZE_KEY_ID`, `WYZE_API_KEY`, `MCP_ALLOWED_HOSTS`
+4. **Deploy the stack.** Portainer clones the repo, builds the image, and
+   starts the container on `:8765`.
+
+To update later: Stacks → `muse` → **Pull and redeploy** (or change the
+reference to a newer branch).
+
+### Or via docker compose on any Docker host on the home network
 
 ```bash
+git clone -b pi-bridge https://github.com/TMTrevisan/pebble-index-mcp.git
+cd pebble-index-mcp
 cp .env.example .env && chmod 600 .env
 # fill in .env (see below), then:
 docker compose up -d
