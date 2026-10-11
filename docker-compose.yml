@@ -1,20 +1,32 @@
 # Muse MCP bridge for the Pebble Index 01 smart ring.
+#
 # Run on Todd's Home Assistant box (via the Portainer add-on's Stacks,
 # or `docker compose up -d` on any Docker host on the home network).
 #
+# Pulls the prebuilt ARM64 image from GHCR — no local build needed.
+# The image is rebuilt by GitHub Actions on every push to the pi-bridge
+# branch. For local dev, uncomment the build: section below and drop
+# the image: line.
+#
 # The container probes for Home Assistant at startup:
 #   http://homeassistant:8123 -> http://localhost:8123 -> http://host.docker.internal:8123
-# Override with HASS_URL in .env if yours differs.
+# Override with HASS_URL if yours differs.
 services:
   muse:
-    build: .
-    image: muse-pebble-mcp:latest
+    image: ghcr.io/tmtrevisan/pebble-index-mcp:pi-bridge
+    # build: .   # local dev only — uncomment and remove image: above to build locally
     container_name: muse-pebble-mcp
     restart: unless-stopped
     ports:
       - "8765:8765"
-    env_file:
-      - .env
     environment:
       MCP_HOST: "0.0.0.0"
       MCP_PORT: "8765"
+      MCP_BEARER_TOKEN: ${MCP_BEARER_TOKEN}
+      HASS_TOKEN: ${HASS_TOKEN}
+      HASS_URL: ${HASS_URL:-http://homeassistant:8123}
+      WYZE_EMAIL: ${WYZE_EMAIL}
+      WYZE_PASSWORD: ${WYZE_PASSWORD}
+      WYZE_KEY_ID: ${WYZE_KEY_ID}
+      WYZE_API_KEY: ${WYZE_API_KEY}
+      MCP_ALLOWED_HOSTS: ${MCP_ALLOWED_HOSTS}
