@@ -1,9 +1,30 @@
-"""Pebble Index MCP bridge: vault + Hermes tools over Streamable HTTP."""
+"""Muse MCP bridge for the Pebble Index 01 smart ring.
+
+Ring -> Pebble app -> Pebble cloud agent -> this server (Streamable HTTP).
+
+Runs on Todd's home network (Home Assistant box via Portainer/Docker),
+so the `ha` tool hits Home Assistant's local REST API directly.
+
+Tools:
+  ha   - Home Assistant via local REST API (HASS_TOKEN long-lived token).
+         Lights, switches, fans, climate (incl. setpoints), covers,
+         media players, sensor reads. Never locks or alarms.
+  wyze - On/off for Todd's two authorized Wyze lights ONLY.
+  ask  - Open-ended questions -> HA's own conversation agent.
+
+Every user-facing answer goes through _spoken_response so the Pebble app's
+coreSchema contract surfaces the ANSWER (not the question) in the phone
+notification.
+"""
 from __future__ import annotations
 
 import hmac
 import logging
 import os
+import re
+import time
+
+import httpx
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -17,97 +38,50 @@ from mcp.types import (
 from mcp.types import Prompt as MCPPrompt
 from starlette.responses import JSONResponse
 
-from .hermes import HermesClient, HermesError, HermesTimeout
 from .homeassistant import HAClient, HAError
-from .vault import Vault, VaultAccessError
-from .vinyl import VinylClient, VinylError
-from .websearch import ExaClient, ExaError
 
-logger = logging.getLogger("pebble_index_mcp")
+logger = logging.getLogger("muse_pebble_mcp")
 
-_VAULT_PATH = os.environ.get("VAULT_PATH", "").strip()
-if _VAULT_PATH:
-    VAULT: Vault | None = Vault(_VAULT_PATH)
-else:
-    VAULT = None
-    logger.warning("VAULT_PATH is not set; vault tools will report an error")
-TOKEN = os.environ.get("MCP_BEARER_TOKEN", "")
-HERMES = HermesClient(
-    url=os.environ.get("HERMES_API_URL", "http://127.0.0.1:8642/v1/chat/completions"),
-    api_key=os.environ.get("HERMES_API_KEY", ""),
-    model=os.environ.get("RING_MODEL", "pebble-ring"),
+# ---------------------------------------------------------------- config
+
+TOKEN = os.environ.get("MCP_BEARER_TOKEN", "").strip()
+
+_HASS_URL_ENV = os.environ.get("HASS_URL", "").strip()
+_HASS_TOKEN = os.environ.get("HASS_TOKEN", "").strip()
+
+# Wyze direct API (wyze-sdk). Todd fills these in; never committed.
+_WYZE = {
+    "email": os.environ.get("WYZE_EMAIL", "").strip(),
+    "password": os.environ.get("WYZE_PASSWORD", "").strip(),
+    "key_id": os.environ.get("WYZE_KEY_ID", "").strip(),
+    "api_key": os.environ.get("WYZE_API_KEY", "").strip(),
+}
+# Standing auth covers exactly these two lights; MACs verified 2026-10-10.
+WYZE_TODDS_MAC = os.environ.get("WYZE_TODDS_MAC", "D03F27102015").strip()
+WYZE_LAMP_MAC = os.environ.get("WYZE_LAMP_MAC", "2CAA8E560872").strip()
+# Other similarly-named bulbs on the account that must NEVER match "Lamp".
+_WYZE_DECOYS = (
+    "small lamp", "office lamp", "nursery lamp", "logan lamp",
+    "kaitlyn's light", "kaitlyn light",
 )
-EXA = ExaClient(api_key=os.environ.get("EXA_API_KEY", ""))
-if not EXA.api_key:
-    logger.warning("EXA_API_KEY is not set; web_search will report an error")
-HA = HAClient(
-    url=os.environ.get("HASS_URL", "http://127.0.0.1:8123"),
-    token=os.environ.get("HASS_TOKEN", ""),
-)
-if not HA.token:
-    logger.warning("HASS_TOKEN is not set; ha_control will report an error")
-VINYL = VinylClient(url=os.environ.get("VINYL_URL", "").strip())
-if not VINYL.url:
-    logger.warning("VINYL_URL is not set; vinyl_lookup will report an error")
+
+# Voice from a ring has no voiceprint auth: never touch locks or alarms.
+_HA_DENY_WORDS = ("lock", "unlock", "alarm", "disarm")
 
 # DNS-rebinding protection: allow loopback plus any hosts named in
-# MCP_ALLOWED_HOSTS (comma-separated). The public tunnel hostname goes there.
+# MCP_ALLOWED_HOSTS (comma-separated). The public DuckDNS hostname goes here.
 _LOOPBACK_HOSTS = ["127.0.0.1:*", "localhost:*", "[::1]:*"]
 _ALLOWED_HOSTS = _LOOPBACK_HOSTS + [
     h.strip() for h in os.environ.get("MCP_ALLOWED_HOSTS", "").split(",") if h.strip()
 ]
 
 mcp = FastMCP(
-    "pebble-index-mcp",
+    "muse",
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=_ALLOWED_HOSTS,
     ),
 )
-
-_VAULT_UNSET_MSG = "VAULT_PATH is not configured; vault tools are unavailable"
-
-
-def _vault_or_error() -> Vault:
-    if VAULT is None:
-        raise VaultAccessError(_VAULT_UNSET_MSG)
-    return VAULT
-
-
-@mcp.tool()
-def vault_search(query: str, max_results: int = 5) -> str:
-    """Search the user's Obsidian vault (case-insensitive text search).
-
-    Use when the user asks where something is or whether a note exists.
-    Returns "relative/path.md: excerpt" lines. Facts about the vault must
-    come from this tool or vault_read; never invent them.
-    """
-    try:
-        return _vault_or_error().search(query, max_results)
-    except VaultAccessError as e:
-        return str(e)
-
-
-@mcp.tool()
-def vault_read(note_path: str, max_chars: int = 1500) -> str:
-    """Read a note from the Obsidian vault. note_path is relative to the vault
-    root, e.g. "Writing/ideas.md". Returns the first max_chars characters."""
-    try:
-        return _vault_or_error().read(note_path, max_chars)
-    except VaultAccessError as e:
-        return str(e)
-
-
-@mcp.tool()
-def vault_append(note_path: str, text: str) -> str:
-    """Append a line to a note in the Obsidian vault, creating it if needed.
-
-    Use only when the user explicitly asks to save or add something. Appends
-    a timestamped "- HH:MM text" line. Never overwrites or deletes."""
-    try:
-        return _vault_or_error().append(note_path, text)
-    except VaultAccessError as e:
-        return f"Could not append: {e}"
 
 
 def _spoken_response(text: str, question: str | None = None) -> CallToolResult:
@@ -119,6 +93,7 @@ def _spoken_response(text: str, question: str | None = None) -> CallToolResult:
     text is surfaced in the notification. `output` is what the cloud agent's
     LLM receives; `content` mirrors it for non-Pebble MCP clients.
     """
+    text = " ".join(str(text).split())[:500]  # notification-sized, no newlines
     semantic: dict = {"type": "Response", "text": text}
     if question is not None:
         semantic["question"] = question
@@ -130,160 +105,222 @@ def _spoken_response(text: str, question: str | None = None) -> CallToolResult:
     return result
 
 
-@mcp.tool()
-def web_search(query: str, max_results: int = 3) -> CallToolResult:
-    """Search the live web for current information.
+# ---------------------------------------------------------------- HA
 
-    Use for news, weather, sports scores, prices, schedules, recent events,
-    or anything that changes over time. Returns a short answer composed from
-    live search results, plus the raw results for reference. For questions
-    about the user's notes, prefer vault_search instead.
-    """
-    try:
-        results = EXA.search(query, max_results)
-    except ExaError as e:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Web search unavailable ({e})")]
-        )
-    try:
-        answer = HERMES.compose_answer(query, results)
-    except (HermesTimeout, HermesError):
-        # Compose is best-effort; fall back to raw results so the cloud
-        # agent can still answer in the feed (notification shows the question).
-        answer = None
-    if not answer:
-        return CallToolResult(content=[TextContent(type="text", text=results)])
-    spoken = answer
-    llm_text = f"{answer}\n\nSources:\n{results}"
-    result = CallToolResult(
-        content=[TextContent(type="text", text=llm_text)],
-        structuredContent={
-            "output": llm_text,
-            "semanticResult": {"type": "Response", "text": spoken, "question": query},
-        },
+_HA_URL_CANDIDATES = [
+    "http://homeassistant:8123",      # same Docker network as HA container
+    "http://localhost:8123",          # host networking
+    "http://host.docker.internal:8123",
+]
+_ha_client: HAClient | None = None
+
+
+def _ha() -> HAClient:
+    """HAClient against the first reachable local HA URL (cached)."""
+    global _ha_client
+    if _ha_client is not None:
+        return _ha_client
+    if not _HASS_TOKEN:
+        raise HAError("Smart home control unavailable: HASS_TOKEN not configured.")
+    candidates = [_HASS_URL_ENV] if _HASS_URL_ENV else _HA_URL_CANDIDATES
+    for url in candidates:
+        try:
+            r = httpx.get(f"{url.rstrip('/')}/api/", timeout=5.0)
+            if r.status_code == 200:
+                _ha_client = HAClient(url=url, token=_HASS_TOKEN)
+                logger.info("Home Assistant reachable at %s", url)
+                return _ha_client
+        except httpx.HTTPError:
+            continue
+    raise HAError(
+        "Home Assistant isn't reachable locally. Set HASS_URL to your HA address."
     )
-    result.meta = {"coreSchema": 1}
-    return result
+
+
+_SETPOINT_RE = re.compile(
+    r"(?:set|change|make).{0,30}?\b(?:thermostat|temperature|temp|degrees?)\b"
+    r".{0,15}?\bto\s+(\d{2})\b"
+)
+_FILLER_EXTRA = {
+    "set", "change", "make", "to", "degrees", "degree",
+    "thermostat", "temperature", "temp",
+}
+
+
+def _climate_setpoint(client: HAClient, command: str) -> str | None:
+    """Handle 'set the thermostat to 72' — returns spoken text or None."""
+    m = _SETPOINT_RE.search(command.lower())
+    if not m:
+        return None
+    temp = int(m.group(1))
+    states = client._get("/api/states")
+    climates = [s for s in states if s["entity_id"].startswith("climate.")]
+    if not climates:
+        raise HAError("No thermostat found in Home Assistant.")
+    words = re.findall(r"[a-z]+", command.lower())
+    tokens = [w for w in words if w not in _FILLER_EXTRA] or ["thermostat"]
+    entity = client.resolve(climates, tokens)
+    eid = entity["entity_id"]
+    friendly = entity["attributes"].get("friendly_name", eid)
+    client._post(
+        "/api/services/climate/set_temperature",
+        {"entity_id": eid, "temperature": temp},
+    )
+    time.sleep(0.5)
+    return f"{friendly} set to {temp} degrees."
 
 
 @mcp.tool()
-def ask_hermes(question: str) -> CallToolResult:
-    """Forward a question or task to the user's AI agent (Hermes).
+def ha(command: str) -> CallToolResult:
+    """Control or check Todd's smart home via Home Assistant.
 
-    Use for questions the vault tools cannot answer: lookups, research, or
-    tasks. Returns the agent's final answer (kept short by instruction)."""
+    ALWAYS use this for smart-home requests like "turn on the living room
+    lights", "bedroom off", "is the kitchen light on", "set the thermostat
+    to 72", "what's the office temperature". command is the spoken request
+    in plain text. Handles lights, switches, fans, climate, covers/blinds,
+    media players, and sensor/status reads. Returns a short spoken answer.
+    Cannot touch locks or alarms from the ring."""
     try:
-        answer = HERMES.ask(question)
-    except HermesTimeout:
-        answer = (
-            "Hermes is still working on it. It will finish shortly; "
-            "re-ask or check Telegram."
+        c = command.lower()
+        if any(k in c for k in _HA_DENY_WORDS):
+            return _spoken_response(
+                "I can't do locks or alarms from the ring — use the Home Assistant app for that.",
+                question=command,
+            )
+        client = _ha()
+        try:
+            spoken = _climate_setpoint(client, command)
+            if spoken:
+                return _spoken_response(spoken, question=command)
+        except HAError as e:
+            return _spoken_response(str(e), question=command)
+        return _spoken_response(client.control(command), question=command)
+    except HAError as e:
+        return _spoken_response(str(e), question=command)
+    except Exception:  # noqa: BLE001
+        logger.exception("ha tool failed")
+        return _spoken_response("Home Assistant isn't responding right now.",
+                                question=command)
+
+
+# ---------------------------------------------------------------- Wyze
+
+def _wyze_client():
+    from wyze_sdk import Client
+
+    missing = [k for k, v in _WYZE.items() if not v]
+    if missing:
+        raise RuntimeError(f"Wyze credentials missing: {', '.join(missing)}")
+    return Client(**_WYZE)
+
+
+def _wyze_model_map(client) -> dict:
+    raw = client._api_client().get_object_list()["data"]["device_list"]
+    return {d.get("mac"): d.get("product_model") for d in raw}
+
+
+@mcp.tool()
+def wyze(command: str) -> CallToolResult:
+    """Control Todd's two Wyze lights: "Todd's light" (bedroom) and "Lamp"
+    (living room) — e.g. "turn off Todd's light", "Lamp on". These are the
+    ONLY lights this tool may touch; similarly-named bulbs (Small Lamp,
+    Office Lamp, etc.) are never valid targets."""
+    try:
+        c = command.lower()
+        scrubbed = c
+        for decoy in _WYZE_DECOYS:
+            scrubbed = scrubbed.replace(decoy, " ")
+        mac, label = None, None
+        if "todd" in scrubbed:
+            mac, label = WYZE_TODDS_MAC, "Todd's light"
+        elif "lamp" in scrubbed or "living room" in scrubbed:
+            mac, label = WYZE_LAMP_MAC, "Lamp"
+        if not mac:
+            return _spoken_response(
+                "I can only control Todd's light and Lamp — which one?",
+                question=command,
+            )
+        has_off = bool(re.search(r"\boff\b|\bout\b", c))
+        has_on = bool(re.search(r"\bon\b", c))
+        if has_off and not has_on:
+            verb, turn = "off", False
+        elif has_on and not has_off:
+            verb, turn = "on", True
+        else:
+            return _spoken_response(f"Turn {label} on or off?", question=command)
+        client = _wyze_client()
+        model = _wyze_model_map(client).get(mac)
+        if not model:
+            return _spoken_response(f"{label} isn't on the Wyze account right now.",
+                                    question=command)
+        if turn:
+            client.bulbs.turn_on(device_mac=mac, device_model=model)
+        else:
+            client.bulbs.turn_off(device_mac=mac, device_model=model)
+        return _spoken_response(f"{label} is now {verb}.", question=command)
+    except RuntimeError as e:
+        return _spoken_response(f"Wyze isn't set up yet ({str(e)[:60]}).",
+                                question=command)
+    except Exception:  # noqa: BLE001
+        logger.exception("wyze tool failed")
+        return _spoken_response(f"{label or 'The light'} didn't respond.",
+                                question=command)
+
+
+# ---------------------------------------------------------------- ask
+
+@mcp.tool()
+def ask(question: str) -> CallToolResult:
+    """Ask Home Assistant's conversation agent anything the ha and wyze tools
+    can't handle. Uses Todd's already-configured HA assistant. Keep the
+    question short; the answer comes back as a phone notification."""
+    try:
+        answer = _ha().conversation(question)
+        return _spoken_response(answer, question=question)
+    except HAError as e:
+        logger.warning("ask via HA conversation failed: %s", e)
+        return _spoken_response(
+            "I couldn't get an answer from the house on that one — try asking me in chat instead.",
+            question=question,
         )
-    except HermesError as e:
-        return CallToolResult(
-            content=[TextContent(type="text", text=f"Hermes unavailable ({e})")]
-        )
-    return _spoken_response(answer, question=question)
 
 
-@mcp.tool()
-def ha_control(command: str) -> CallToolResult:
-    """Control the user's smart home: lights, switches, fans, and media players.
+# ---------------------------------------------------------------- persona prompt
 
-    ALWAYS use this for smart-home commands like "living room lights on",
-    "bedroom off", "toggle the hallway", or "is the living room tv on",
-    instead of ask_hermes. command is the spoken request in plain text.
-    Supported actions: on, off, toggle, status. Verifies the change and
-    returns the device's new state."""
-    try:
-        text = HA.control(command)
-    except HAError as e:
-        return _spoken_response(str(e), question=command)
-    return _spoken_response(text, question=command)
-
-
-@mcp.tool()
-def ha_announce(message: str) -> CallToolResult:
-    """Make a spoken announcement on the house speaker(s), like an intercom.
-
-    Use when the user says "tell everyone ...", "announce ...", or "tell the
-    house ...". message is ONLY the words to speak, with the routing phrase
-    stripped (for "tell the house dinner is ready", message is "dinner is
-    ready"). Keep it short. Returns the number of speakers it played on."""
-    try:
-        text = HA.announce(message)
-    except HAError as e:
-        return _spoken_response(str(e), question=command)
-    return _spoken_response(text, question=message)
-
-
-@mcp.tool()
-def vinyl_lookup(command: str) -> CallToolResult:
-    """Look things up in the user's vinyl record catalog.
-
-    Use when the user asks whether they own a record (essential before
-    buying a duplicate at a record store), wants a random record to spin,
-    or asks for their most-played records. command is the spoken request in
-    plain text, e.g. "do I own Eternal Blue by Spiritbox", "pick a random
-    record", "most played records this year". Returns what they own,
-    including pressing counts."""
-    try:
-        text = VINYL.lookup(command)
-    except VinylError as e:
-        return _spoken_response(str(e), question=command)
-    return _spoken_response(text, question=command)
-
-
-@mcp.tool()
-def ha_music(command: str) -> CallToolResult:
-    """Play or stop music on the house speakers (Deezer via Music Assistant).
-
-    Use for requests like "play Spiritbox in the basement", "play the album
-    Blue Rev in the kitchen", "play the song Granite", or "stop the music in
-    the living room". command is the spoken request. No room named means the
-    Voice PE speaker. Verifies playback started and returns what is playing."""
-    try:
-        text = HA.music(command)
-    except HAError as e:
-        return _spoken_response(str(e), question=command)
-    return _spoken_response(text, question=command)
-
-
-_GENERIC_PERSONA = (
-    "You are a voice assistant answering through a Pebble Index smart ring. "
-    "The user's Obsidian vault lives at the vault root.\n"
+_MUSE_PERSONA = (
+    "You are Muse, Todd's personal AI assistant, answering through his Pebble "
+    "Index 01 smart ring. Todd lives in Clairemont, San Diego.\n"
+    "Your tools:\n"
+    "- `ha`: his smart home — lights, switches, fans, climate, covers/blinds, "
+    "media players, sensor reads. ALWAYS use this for home commands, never guess.\n"
+    "- `wyze`: ONLY his two Wyze lights — \"Todd's light\" (bedroom) and \"Lamp\" "
+    "(living room). Use for on/off of exactly these.\n"
+    "- `ask`: anything needing explanations, advice, current information, or "
+    "judgment — anything ha/wyze can't do.\n"
     "Rules:\n"
-    "- Answer in at most 3 short sentences. No markdown. The answer is "
-    "shown as a phone notification.\n"
-    "- Facts about the vault must come from vault_search or vault_read. "
-    "Never invent note contents or file names.\n"
-    "- When asked to save something, use vault_append; if the target note "
-    "is unclear, use Inbox.md.\n"
-    "- For anything beyond the vault, forward to ask_hermes rather than "
-    "guessing.\n"
-    "- For news, weather, prices, scores, or anything current, use "
-    "web_search first, then answer from its results.\n"
-    "- If you do not know, say so."
+    "- Answer in at most 3 short sentences. No markdown. The answer appears as "
+    "a phone notification.\n"
+    "- Prefer direct tools over ask for home control.\n"
+    "- If you do not know, say so honestly.\n"
+    "- Never mention tokens, URLs, file paths, or system internals."
 )
 
 
 def _ring_persona_text() -> str:
-    # Operators can override the generic persona with their own file
-    # (e.g. to teach the agent the user's name, hobbies, and vault layout).
+    # Operators can override with their own file (name, household layout, etc).
     path = os.environ.get("RING_PERSONA_FILE", "").strip()
     if path:
         try:
             return open(path, encoding="utf-8").read().strip()
         except OSError:
-            logger.warning("RING_PERSONA_FILE unreadable (%s); using generic persona", path)
-    return _GENERIC_PERSONA
+            logger.warning("RING_PERSONA_FILE unreadable (%s); using built-in persona", path)
+    return _MUSE_PERSONA
 
 
-# The prompt is registered on the LOW-LEVEL server rather than through
-# FastMCP's prompt manager because FastMCP serializes `arguments` as an empty
-# list, and the Pebble app's Kotlin client drops any prompt whose `arguments`
-# field is a non-null list (it checks `arguments == null`). Emitting null
-# makes ring_persona selectable in the app.
+# Registered on the LOW-LEVEL server (not FastMCP's prompt manager) because
+# FastMCP serializes `arguments` as an empty list, and the Pebble app's Kotlin
+# client drops any prompt whose `arguments` field is a non-null list
+# (it checks `arguments == null`). Emitting null keeps ring_persona selectable.
 PROMPT_NAME = "ring_persona"
 PROMPT_DESCRIPTION = (
     "Persona for the Pebble cloud agent. Select this prompt in the Pebble "
@@ -321,12 +358,7 @@ mcp._mcp_server.get_prompt()(_handle_get_prompt)
 
 
 def make_app():
-    """Return the FastMCP streamable-http app wrapped in bearer-token auth.
-
-    All config (TOKEN, VAULT, allowed hosts) is read once at import time;
-    rotating the bearer token or changing allowed hosts requires a service
-    restart, which is the accepted cost of not re-reading env per request.
-    """
+    """Return the FastMCP streamable-http app wrapped in bearer-token auth."""
     if not TOKEN:
         logger.warning(
             "MCP_BEARER_TOKEN is empty; every request will be rejected (401). "
@@ -361,7 +393,7 @@ if __name__ == "__main__":
 
     uvicorn.run(
         "pebble_index_mcp.server:app",
-        host=os.environ.get("MCP_HOST", "127.0.0.1"),
+        host=os.environ.get("MCP_HOST", "0.0.0.0"),
         port=int(os.environ.get("MCP_PORT", "8765")),
         log_level="info",
     )

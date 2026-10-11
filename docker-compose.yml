@@ -1,0 +1,20 @@
+# Muse MCP bridge for the Pebble Index 01 smart ring.
+# Run on Todd's Home Assistant box (via the Portainer add-on's Stacks,
+# or `docker compose up -d` on any Docker host on the home network).
+#
+# The container probes for Home Assistant at startup:
+#   http://homeassistant:8123 -> http://localhost:8123 -> http://host.docker.internal:8123
+# Override with HASS_URL in .env if yours differs.
+services:
+  muse:
+    build: .
+    image: muse-pebble-mcp:latest
+    container_name: muse-pebble-mcp
+    restart: unless-stopped
+    ports:
+      - "8765:8765"
+    env_file:
+      - .env
+    environment:
+      MCP_HOST: "0.0.0.0"
+      MCP_PORT: "8765"

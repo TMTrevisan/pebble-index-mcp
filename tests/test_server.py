@@ -1,4 +1,6 @@
 import importlib
+import json
+import types
 from contextlib import asynccontextmanager
 
 import httpx
@@ -136,16 +138,9 @@ async def test_configured_host_allowed(app_with_host):
     assert r.status_code == 200
 
 
-def test_vault_tool_without_vault_path(monkeypatch):
-    import pebble_index_mcp.server as srv
+# ---------------------------------------------------------------- unit tests
 
-    monkeypatch.delenv("VAULT_PATH", raising=False)
-    monkeypatch.setenv("MCP_BEARER_TOKEN", "sekret")
-    importlib.reload(srv)
-    assert "VAULT_PATH is not configured" in srv.vault_search("anything")
-
-
-def _reload(monkeypatch, **env):
+def _unit_srv(monkeypatch, **env):
     monkeypatch.setenv("MCP_BEARER_TOKEN", "sekret")
     for k, v in env.items():
         monkeypatch.setenv(k, v)
@@ -155,59 +150,174 @@ def _reload(monkeypatch, **env):
     return srv
 
 
-def test_web_search_returns_core_schema_response(monkeypatch):
-    srv = _reload(monkeypatch, VAULT_PATH="")
-    monkeypatch.setattr(srv.EXA, "search", lambda q, max_results=3: "Result (https://a)\nSnip")
-    monkeypatch.setattr(srv.HERMES, "compose_answer", lambda q, r: "The launch is Friday.")
-
-    r = srv.web_search("when is the launch")
+def _check_contract(r):
+    """Every user-facing answer must carry the Pebble coreSchema contract."""
     assert r.meta == {"coreSchema": 1}
     sc = r.structuredContent
-    assert sc["output"].startswith("The launch is Friday.")
-    assert "Result (https://a)" in sc["output"]  # sources ride along for the LLM
-    assert sc["semanticResult"] == {
+    assert sc["semanticResult"]["type"] == "Response"
+    assert sc["output"] == r.content[0].text
+
+
+def test_ha_denies_lock_and_alarm_commands(monkeypatch):
+    srv = _unit_srv(monkeypatch)
+
+    def boom():
+        raise AssertionError("HA must not be reached for locks/alarms")
+
+    monkeypatch.setattr(srv, "_ha", boom)
+    r = srv.ha("unlock the front door")
+    _check_contract(r)
+    assert "can't do locks or alarms" in r.content[0].text
+
+    r = srv.ha("disarm the alarm")
+    assert "can't do locks or alarms" in r.content[0].text
+
+
+def test_ha_control_success(monkeypatch):
+    srv = _unit_srv(monkeypatch, HASS_TOKEN="x")
+
+    class FakeHA:
+        def control(self, command):
+            assert command == "turn on the living room"
+            return "Living Room is now on."
+
+    monkeypatch.setattr(srv, "_ha", lambda: FakeHA())
+    r = srv.ha("turn on the living room")
+    _check_contract(r)
+    assert r.content[0].text == "Living Room is now on."
+    assert r.structuredContent["semanticResult"] == {
         "type": "Response",
-        "text": "The launch is Friday.",
-        "question": "when is the launch",
+        "text": "Living Room is now on.",
+        "question": "turn on the living room",
     }
-    assert r.content[0].text == sc["output"]
 
 
-def test_web_search_falls_back_to_plain_text_without_compose(monkeypatch):
-    srv = _reload(monkeypatch, VAULT_PATH="")
+def test_ha_climate_setpoint(monkeypatch):
+    srv = _unit_srv(monkeypatch, HASS_TOKEN="x")
+    calls = {}
 
-    def boom(q, r):
-        raise srv.HermesTimeout("slow")
+    class FakeHA:
+        def _get(self, path):
+            return [{
+                "entity_id": "climate.thermostat",
+                "state": "heat",
+                "attributes": {"friendly_name": "Thermostat"},
+            }]
 
-    monkeypatch.setattr(srv.EXA, "search", lambda q, max_results=3: "Result (https://a)\nSnip")
-    monkeypatch.setattr(srv.HERMES, "compose_answer", boom)
+        def resolve(self, states, tokens):
+            return states[0]
 
-    r = srv.web_search("q")
-    assert r.meta is None
-    assert r.structuredContent is None
-    assert "Result (https://a)" in r.content[0].text
+        def _post(self, path, payload):
+            calls["path"] = path
+            calls["payload"] = payload
+            return {}
 
-
-def test_web_search_exa_error_is_content(monkeypatch):
-    srv = _reload(monkeypatch, VAULT_PATH="")
-
-    def boom(q, max_results=3):
-        raise srv.ExaError("HTTP 500: sad")
-
-    monkeypatch.setattr(srv.EXA, "search", boom)
-    r = srv.web_search("q")
-    assert "Web search unavailable" in r.content[0].text
+    monkeypatch.setattr(srv, "_ha", lambda: FakeHA())
+    r = srv.ha("set the thermostat to 72")
+    _check_contract(r)
+    assert calls["path"] == "/api/services/climate/set_temperature"
+    assert calls["payload"] == {"entity_id": "climate.thermostat", "temperature": 72}
+    assert "72 degrees" in r.content[0].text
 
 
-def test_ask_hermes_returns_core_schema_response(monkeypatch):
-    srv = _reload(monkeypatch, VAULT_PATH="")
-    monkeypatch.setattr(srv.HERMES, "ask", lambda q: "Two plus two is four.")
+def test_ha_missing_token_is_graceful(monkeypatch):
+    srv = _unit_srv(monkeypatch)  # no HASS_TOKEN
+    r = srv.ha("turn on the kitchen")
+    _check_contract(r)
+    assert "HASS_TOKEN" in r.content[0].text
 
-    r = srv.ask_hermes("what is 2 plus 2")
-    assert r.meta == {"coreSchema": 1}
-    assert r.structuredContent["semanticResult"]["type"] == "Response"
-    assert r.structuredContent["semanticResult"]["text"] == "Two plus two is four."
-    assert r.structuredContent["output"] == "Two plus two is four."
+
+def _fake_wyze(monkeypatch, srv):
+    calls = []
+
+    class FakeBulbs:
+        def turn_on(self, device_mac, device_model):
+            calls.append(("on", device_mac, device_model))
+
+        def turn_off(self, device_mac, device_model):
+            calls.append(("off", device_mac, device_model))
+
+    class FakeClient:
+        bulbs = FakeBulbs()
+
+    monkeypatch.setattr(srv, "_wyze_client", lambda: FakeClient())
+    monkeypatch.setattr(
+        srv, "_wyze_model_map",
+        lambda client: {"D03F27102015": "WLPA19", "2CAA8E560872": "WLPA19"},
+    )
+    return calls
+
+
+def test_wyze_todds_light_off(monkeypatch):
+    srv = _unit_srv(monkeypatch)
+    calls = _fake_wyze(monkeypatch, srv)
+    r = srv.wyze("turn off Todd's light")
+    _check_contract(r)
+    assert calls == [("off", "D03F27102015", "WLPA19")]
+    assert r.content[0].text == "Todd's light is now off."
+
+
+def test_wyze_lamp_on(monkeypatch):
+    srv = _unit_srv(monkeypatch)
+    calls = _fake_wyze(monkeypatch, srv)
+    r = srv.wyze("turn on the lamp")
+    assert calls == [("on", "2CAA8E560872", "WLPA19")]
+    assert r.content[0].text == "Lamp is now on."
+
+
+def test_wyze_decoy_lamp_does_not_match(monkeypatch):
+    """The similarly-named decoy bulbs must never be treated as Todd's Lamp."""
+    srv = _unit_srv(monkeypatch)
+    calls = _fake_wyze(monkeypatch, srv)
+    r = srv.wyze("turn on the small lamp")
+    assert calls == []  # decoy scrubbed, no valid target
+    assert r.content[0].text == "I can only control Todd's light and Lamp — which one?"
+
+
+def test_wyze_ambiguous_toggle_asks_on_or_off(monkeypatch):
+    srv = _unit_srv(monkeypatch)
+    calls = _fake_wyze(monkeypatch, srv)
+    r = srv.wyze("toggle the lamp")
+    assert calls == []
+    assert r.content[0].text == "Turn Lamp on or off?"
+
+
+def test_wyze_missing_creds_is_graceful(monkeypatch):
+    srv = _unit_srv(monkeypatch)  # no WYZE_* env
+    r = srv.wyze("turn on the lamp")
+    _check_contract(r)
+    assert "isn't set up yet" in r.content[0].text
+
+
+def test_ask_without_ha_is_graceful(monkeypatch):
+    srv = _unit_srv(monkeypatch)  # no HASS_TOKEN
+
+    def boom():
+        from pebble_index_mcp.homeassistant import HAError
+
+        raise HAError("Smart home control unavailable: HASS_TOKEN not configured.")
+
+    monkeypatch.setattr(srv, "_ha", boom)
+    r = srv.ask("what is the capital of france")
+    _check_contract(r)
+    assert "in chat instead" in r.content[0].text
+
+
+def test_ask_returns_answer(monkeypatch):
+    srv = _unit_srv(monkeypatch, HASS_TOKEN="k")
+
+    class FakeHA:
+        def conversation(self, question):
+            return "Paris is the capital of France."
+
+    monkeypatch.setattr(srv, "_ha", lambda: FakeHA())
+    r = srv.ask("what is the capital of france")
+    _check_contract(r)
+    assert r.content[0].text == "Paris is the capital of France."
+    assert (
+        r.structuredContent["semanticResult"]["question"]
+        == "what is the capital of france"
+    )
 
 
 async def test_prompts_list_arguments_null(app_with_token):

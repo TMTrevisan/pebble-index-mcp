@@ -1,100 +1,123 @@
-# pebble-index-mcp
+# muse — Pebble Index 01 MCP bridge
 
-MCP bridge that exposes a local Obsidian vault and a Hermes Agent instance to
-the Pebble Index 01 smart ring's double-click MCP sandbox. Voice captures from
-the ring are routed by the Pebble app's cloud agent into this server's tools,
-and the answer comes back as a phone notification.
+Lets Todd talk to Muse through his Pebble Index 01 smart ring. Voice goes
+ring → Pebble app → Pebble cloud agent → this server's tools, and the answer
+comes back as a phone notification.
 
-## Architecture
+Three tools:
 
-```
-[Index ring] → [Pebble app] → [Pebble cloud agent] → [this MCP server]
-                                                        ├─ vault tools (local files)
-                                                        ├─ ha_control → Home Assistant REST API
-                                                        ├─ ha_announce → assist_satellite.announce
-                                                        ├─ vinyl_lookup → vinyl catalog API
-                                                        └─ ask_hermes → Hermes API server
-```
-
-- The server speaks MCP over Streamable HTTP (official `mcp` SDK, FastMCP).
-- Every request must carry a bearer token; anything else gets 401.
-- FastMCP's DNS-rebinding protection is on: allowed hosts are loopback plus
-  anything listed in `MCP_ALLOWED_HOSTS`.
-- The public exposure is a cloudflared tunnel to the loopback port; no cloud
-  infrastructure is required beyond that.
-
-## Components
-
-| Path | Role |
+| Tool | What it does |
 |---|---|
-| `src/pebble_index_mcp/vault.py` | `Vault`: path-sandboxed read/append + ripgrep search over the vault. All paths resolve inside the vault root; absolute paths, `..` traversal, and symlink escapes are rejected. Appends are append-only, timestamped, and never overwrite. |
-| `src/pebble_index_mcp/hermes.py` | `HermesClient`: forwards questions to an OpenAI-compatible chat completions endpoint with a short-answer system hint. Maps timeouts/transport failures/bad shapes onto `HermesTimeout`/`HermesError`. |
-| `src/pebble_index_mcp/websearch.py` | `ExaClient`: live web search against the Exa API, snippets truncated locally. Errors map to `ExaError`; a missing key short-circuits with a clear message. |
-| `src/pebble_index_mcp/homeassistant.py` | `HAClient`: deterministic smart-home commands against the Home Assistant REST API. Parses the action from the command text, resolves the target entity by token match (preferring room group entities over individual fixtures and available over unavailable entities), calls the service, then polls the state readback to confirm. No LLM in the loop. Also `announce()`: intercom messages to every live `assist_satellite` (offline satellites are pre-filtered because HA returns 200 for announce regardless). |
-| `src/pebble_index_mcp/vinyl.py` | `VinylClient`: lookups against the operator's self-hosted vinyl catalog API. Routes command text to a random pick, most-played list, or artist/album search; conversational filler is stripped before the catalog's full-text query. Base URL is operator config only. |
-| `src/pebble_index_mcp/server.py` | FastMCP app: registers the eight tools and the `ring_persona` prompt, wraps the streamable-http app in bearer auth (constant-time compare) and configures host allow-listing. |
+| `ha` | Home Assistant over the local REST API — lights, switches, fans, climate (including "set the thermostat to 72"), covers, media players, sensor reads. Never touches locks or alarms. |
+| `wyze` | On/off for exactly two lights: "Todd's light" (bedroom) and "Lamp" (living room). Nothing else on the Wyze account. |
+| `ask` | Anything else — forwarded to Home Assistant's own conversation agent, so whatever assistant Todd has configured in HA answers. |
 
-## Tools
+## Run it (on the Home Assistant box)
 
-- `vault_search(query, max_results=5)` — case-insensitive text search; returns `path: excerpt` lines.
-- `vault_read(note_path, max_chars=1500)` — reads the head of a note.
-- `vault_append(note_path, text)` — appends a timestamped `- HH:MM text` line, creating the note if needed.
-- `ask_hermes(question)` — forwards to the Hermes API server; 60s timeout with an honest acknowledgment on miss.
-- `ha_control(command)` — smart-home commands: `"living room lights on"`, `"bedroom off"`, `"toggle the hallway"`, `"is the living room tv on"`. Resolves the entity against Home Assistant's state list (room groups win over individual fixtures; ambiguous matches return the candidates instead of guessing), calls the service, and polls the state readback so the confirmation reflects the NEW state. Domains: light, switch, fan, cover, media_player. Requires `HASS_TOKEN`. Milliseconds-to-seconds latency; never route smart-home commands through `ask_hermes`.
-- `ha_announce(message)` — intercom: speaks `message` on every live `assist_satellite` device with a pre-announce chime. Offline satellites are skipped (HA returns 200 for announce even when the device is down, so the tool pre-filters). Requires `HASS_TOKEN`.
-- `ha_music(command)` — music control: `"play Spiritbox in the basement"`, `"play the album Blue Rev in the kitchen"`, `"stop the music in the living room"`. Routes to Music Assistant players (the `media_player.*_2` entities) through Home Assistant's `play_media` service, verifies the cast started by polling the player's `media_title`, and falls back across artist/track/album interpretations when a search comes back empty. Room map and the no-room default (Voice PE) live in `homeassistant.py`. Requires `HASS_TOKEN` and a running Music Assistant with the Deezer provider.
-- `vinyl_lookup(command)` — queries the operator's self-hosted vinyl catalog: owned-record search ("do I own Eternal Blue"), a dormancy-weighted random pick, or most-played records. Requires `VINYL_URL`.
-- `web_search(query, max_results=3)` — live web search via the Exa API, composed into a short spoken answer by the configured model. Requires `EXA_API_KEY`.
-
-Both answer tools wrap their result in the Pebble app's private `coreSchema` contract (`_meta: {"coreSchema": 1}` plus `structuredContent` carrying a `Response` semantic result). Without it, the app's completion notification shows the transcription of the question instead of the answer. If the compose step fails, `web_search` falls back to raw results (the notification then shows the question; the agent still answers in the feed).
-
-## Security
-
-- **Auth**: static bearer token (`MCP_BEARER_TOKEN`), constant-time compared, required on every request. An empty token fails closed (all requests 401) and logs a warning at startup.
-- **Transport**: TLS terminates at the tunnel edge; the origin listens on loopback only.
-- **Host validation**: DNS-rebinding protection rejects requests whose Host header is not loopback or in `MCP_ALLOWED_HOSTS`.
-- **Path sandbox**: vault tools resolve all paths and require them to stay inside the vault root; symlink escapes are rejected and file opens use `O_NOFOLLOW` on the final component. The sandbox guards against accidental and remote misuse; a hostile local process that races a parent-directory swap can still win (documented TOCTOU boundary — the vault is assumed to be a trusted single-user directory).
-- **Config is read once at import**: rotating the bearer token or changing allowed hosts requires a service restart.
-- **Secrets**: the Hermes API key and MCP token live in a 0600 env file outside this repo, never in code, logs, or commits.
-- **Privacy note**: recordings routed through the double-click sandbox transit the Pebble app's cloud agent. Single-click captures stay on-device. Sensitive thoughts belong on single-click.
-
-## Configuration (env)
-
-| Var | Default | Purpose |
-|---|---|---|
-| `VAULT_PATH` | — | **Required.** Vault root for the file tools |
-| `MCP_HOST` / `MCP_PORT` | `127.0.0.1` / `8765` | Listen address |
-| `MCP_BEARER_TOKEN` | — | Required; request auth token |
-| `MCP_ALLOWED_HOSTS` | — | Comma-separated extra allowed Host values (the public tunnel hostname goes here) |
-| `HERMES_API_URL` | `http://127.0.0.1:8642/v1/chat/completions` | ask_hermes target |
-| `HERMES_API_KEY` | — | API server bearer key |
-| `RING_MODEL` | `pebble-ring` | Model alias sent upstream (map it to a cheap model via the API server's `model_routes`) |
-| `EXA_API_KEY` | — | Exa API key for `web_search`; without it the tool reports an error but the rest of the server works |
-| `HASS_URL` | `http://127.0.0.1:8123` | Home Assistant base URL for `ha_control` / `ha_announce` |
-| `HASS_TOKEN` | — | Home Assistant long-lived access token for `ha_control` / `ha_announce`; without it those tools report an error but the rest of the server works |
-| `VINYL_URL` | — | Base URL of a vinyl catalog API exposing `GET /api/records?q=`, `GET /api/random`, `GET /api/plays/top` for `vinyl_lookup`; without it the tool reports an error but the rest of the server works |
-| `RING_PERSONA_FILE` | — | Optional path to a text file replacing the generic cloud-agent persona |
-
-`HERMES_API_URL` accepts any OpenAI-compatible chat completions endpoint, so
-`ask_hermes` works against OpenRouter directly, Ollama, or any other
-compatible API — Hermes is just the default.
-
-## Development
+This is built for Todd's Home Assistant OS machine, deployed through the
+**Portainer add-on** (already installed) → **Stacks** → **Add stack**,
+paste the contents of `docker-compose.yml`, and add the environment
+variables below. Or on any Docker host on the home network:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
-.venv/bin/pytest -v
+cp .env.example .env && chmod 600 .env
+# fill in .env (see below), then:
+docker compose up -d
 ```
 
-Run locally: set the env vars above and `python -m pebble_index_mcp.server`.
+The server listens on `:8765` and probes for Home Assistant at
+`http://homeassistant:8123` (then `localhost:8123`, then
+`host.docker.internal:8123`). Set `HASS_URL` explicitly if needed.
 
-## Deployment
+### 1. Home Assistant token
 
-`deploy/` contains a systemd user unit template and a cloudflared tunnel
-template (hostname and credentials filled in on the host, not in this repo).
-See `docs/ring-checklist.md` for the phone-side setup and test matrix.
+HA → click your profile (bottom-left) → **Long-Lived Access Tokens** →
+Create Token. Paste it as `HASS_TOKEN` in `.env`. The server talks to HA
+over the local network — no cloud round-trip.
 
-## License
+### 2. Wyze credentials (for the `wyze` tool)
 
-MIT — see [LICENSE](LICENSE).
+`WYZE_EMAIL`, `WYZE_PASSWORD`, `WYZE_KEY_ID`, `WYZE_API_KEY` in `.env`.
+Without them, `wyze` says it isn't set up; everything else works.
+
+### 4. Bearer token (Pebble app → server auth)
+
+Generate one and put it in `.env`:
+
+```bash
+openssl rand -hex 32
+```
+
+Every request without `Authorization: Bearer <token>` gets a 401.
+
+### 5. Expose it through the existing DuckDNS + HTTPS setup
+
+The Pebble app needs a public `https://` URL ending in `/mcp`. Two options:
+
+**A. NGINX Home Assistant SSL proxy add-on (recommended — already installed).**
+Add a location to the existing proxy config:
+
+```nginx
+location /mcp {
+    proxy_pass http://<container-ip-or-hostname>:8765;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Authorization $http_authorization;
+}
+```
+
+Then the MCP URL is `https://<your-duckdns-host>/mcp`.
+
+**B. New port forward.** Forward an external port to the box's 8765 and
+terminate TLS in front of it (the app requires HTTPS).
+
+Also add your public hostname to `MCP_ALLOWED_HOSTS` in `.env`
+(e.g. `MCP_ALLOWED_HOSTS=petitcasa.duckdns.org`) — the server rejects
+requests whose Host header isn't allowlisted (DNS-rebinding protection).
+
+## Phone setup (Pebble app)
+
+1. Index tab → **MCP Settings** → Groups → create a sandbox group.
+   - **Model type: `Default`** — the `Index Agent` type ignores custom MCP
+     servers. This is the gotcha that bites everyone.
+2. **MCP Servers** tab → Add HTTP MCP Server:
+   - **Name:** `muse` (no spaces — spaces break tool routing)
+   - **URL:** `https://<your-duckdns-host>/mcp`
+   - **Type:** **Streamable** (not SSE)
+   - **Authorization:** literally `Bearer <your-token>` — the `Bearer `
+     prefix is REQUIRED; the raw token alone 401s on every request
+   - **Group:** the sandbox group from step 1
+3. In the server's settings, select the `ring_persona` prompt so it joins
+   the agent's system prompt.
+4. Index settings → **"Double click and hold"** → assign the sandbox group.
+   Keep single click as the default Index agent for private offline notes.
+
+## How replies get back to the phone
+
+No separate push setup needed. The Pebble app builds the completion
+notification from the **last tool result** — every tool returns the
+`coreSchema` Response contract, so the phone shows the *answer*, not the
+question. (A plain-text tool result would show the transcription instead.)
+
+## Security notes
+
+- Bearer token on every request (constant-time compare); 401 otherwise.
+- DNS-rebinding protection: only loopback + `MCP_ALLOWED_HOSTS` are served.
+- `.env` is git-ignored; the example ships empty. Secrets never appear in
+  logs — the server logs that a token is missing, never its value.
+- The `ha` tool refuses anything matching lock/unlock/alarm/disarm.
+- The `wyze` tool can only address the two MACs in `WYZE_TODDS_MAC` /
+  `WYZE_LAMP_MAC`; similarly-named bulbs are scrubbed before matching.
+
+## For developers
+
+```bash
+python3.11 -m venv .venv && .venv/bin/pip install -e ".[dev]"
+.venv/bin/python -m pytest tests/ -q
+```
+
+`mcp==1.29.0` is pinned deliberately: `server.py` registers the
+`ring_persona` prompt on the low-level server so `prompts/list` emits
+`"arguments": null`, which the Pebble app's client requires (it hides
+prompts whose `arguments` is a non-null list). Bump only with
+`test_prompts_list_arguments_null` green.
