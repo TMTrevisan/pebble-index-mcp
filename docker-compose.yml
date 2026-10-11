@@ -13,7 +13,7 @@
 # Override with HASS_URL if yours differs.
 services:
   muse:
-    image: ghcr.io/tmtrevisan/pebble-index-mcp:pi-bridge
+    image: acisco2/pebble-index-mcp:pi-bridge
     # build: .   # local dev only — uncomment and remove image: above to build locally
     container_name: muse-pebble-mcp
     restart: unless-stopped
