@@ -8,11 +8,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install first for better layer caching.
+# Copy project metadata + sources before install (src-layout: pip needs src/ present).
 COPY pyproject.toml ./
-RUN pip install --upgrade pip && pip install .
-
 COPY src/ ./src/
+RUN pip install --upgrade pip && pip install .
 
 RUN useradd --create-home --shell /usr/sbin/nologin muse \
     && chown -R muse:muse /app
