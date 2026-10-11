@@ -10,7 +10,7 @@ Three tools:
 |---|---|
 | `ha` | Home Assistant over the local REST API — lights, switches, fans, climate (including "set the thermostat to 72"), covers, media players, sensor reads. Never touches locks or alarms. |
 | `wyze` | On/off for exactly two lights: "Todd's light" (bedroom) and "Lamp" (living room). Nothing else on the Wyze account. |
-| `ask` | Anything else — forwarded to Home Assistant's own conversation agent, so whatever assistant Todd has configured in HA answers. |
+| `ask_muse` | Anything else — the question is queued for Muse himself, who answers over an HTTPS bridge (`GET /queue/pending` + `POST /queue/answer`). See "How ask_muse reaches Muse" below. |
 
 ## Run it (on the Home Assistant box)
 
@@ -40,7 +40,7 @@ over the local network — no cloud round-trip.
 `WYZE_EMAIL`, `WYZE_PASSWORD`, `WYZE_KEY_ID`, `WYZE_API_KEY` in `.env`.
 Without them, `wyze` says it isn't set up; everything else works.
 
-### 4. Bearer token (Pebble app → server auth)
+### 3. Bearer token (Pebble app → server auth)
 
 Generate one and put it in `.env`:
 
@@ -50,7 +50,7 @@ openssl rand -hex 32
 
 Every request without `Authorization: Bearer <token>` gets a 401.
 
-### 5. Expose it through the existing DuckDNS + HTTPS setup
+### 4. Expose it through the existing DuckDNS + HTTPS setup
 
 The Pebble app needs a public `https://` URL ending in `/mcp`. Two options:
 
@@ -59,6 +59,14 @@ Add a location to the existing proxy config:
 
 ```nginx
 location /mcp {
+    proxy_pass http://<container-ip-or-hostname>:8765;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header Authorization $http_authorization;
+}
+# The ask_muse bridge: lets Muse's cron poll for ring questions and post
+# answers back. Same auth as /mcp.
+location /queue/ {
     proxy_pass http://<container-ip-or-hostname>:8765;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
@@ -91,6 +99,24 @@ requests whose Host header isn't allowlisted (DNS-rebinding protection).
    the agent's system prompt.
 4. Index settings → **"Double click and hold"** → assign the sandbox group.
    Keep single click as the default Index agent for private offline notes.
+
+## How ask_muse reaches Muse
+
+The `ask_muse` tool doesn't answer locally — it hands the question to Muse
+himself, who runs on a different machine:
+
+1. The tool writes `queue/<id>.json` (`{"id", "question", "ts"}`) and waits
+   up to 150s for `queue/<id>.answer.json` to appear.
+2. Muse's cron polls `GET https://<your-duckdns-host>/queue/pending` with
+   `Authorization: Bearer <token>`. It returns the oldest unanswered question
+   (and marks it claimed so it isn't delivered twice), or 204 when empty.
+3. Muse answers and `POST`s `{"id", "answer"}` to `/queue/answer`, which
+   writes the answer file; the waiting tool picks it up and returns it
+   through the coreSchema contract.
+4. Both endpoints require the same bearer token (401 otherwise).
+
+If no answer arrives in 150s the tool says so gracefully — ask in chat
+instead. Rough latency for a ring question is about a minute.
 
 ## How replies get back to the phone
 

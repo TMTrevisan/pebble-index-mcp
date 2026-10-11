@@ -263,33 +263,6 @@ class HAClient:
         noun = "speaker" if len(live) == 1 else "speakers"
         return f"Announced on {len(live)} {noun}."
 
-    # -- conversation (HA Assist / conversation agent) ------------------------
-
-    def conversation(self, text: str) -> str:
-        """Ask HA's conversation agent a question.
-
-        Uses the already-configured HA assistant (whatever conversation agent
-        Todd has set up — LLM-backed or local). Returns the spoken answer.
-        Raises HAError when HA can't answer.
-        """
-        text = text.strip()
-        if not text:
-            raise HAError("Empty question.")
-        try:
-            status, data = self._post_raw(
-                "/api/conversation/process", {"text": text, "language": "en"}
-            )
-        except Exception as e:
-            raise HAError(f"Conversation API unreachable: {e}")
-        if status != 200 or not isinstance(data, dict):
-            raise HAError(f"Conversation API returned {status}.")
-        response = data.get("response") or {}
-        speech = ((response.get("speech") or {}).get("plain") or {}).get("speech", "")
-        speech = speech.strip()
-        if not speech or response.get("response_type") == "error":
-            raise HAError("HA's assistant couldn't answer that.")
-        return speech
-
     # -- music (Music Assistant players surfaced as media_player.*_2) --------
 
     # (spoken key, entity_id). Longest keys first so "master bedroom" wins

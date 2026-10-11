@@ -289,35 +289,138 @@ def test_wyze_missing_creds_is_graceful(monkeypatch):
     assert "isn't set up yet" in r.content[0].text
 
 
-def test_ask_without_ha_is_graceful(monkeypatch):
-    srv = _unit_srv(monkeypatch)  # no HASS_TOKEN
+def test_ask_muse_returns_answer(monkeypatch, tmp_path):
+    """ask_muse writes a question file; when the answer file appears the
+    tool returns it through the contract."""
+    import threading
 
-    def boom():
-        from pebble_index_mcp.homeassistant import HAError
+    srv = _unit_srv(monkeypatch)
+    monkeypatch.setattr(srv, "_QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(srv, "_ASK_POLL_S", 0.05)
 
-        raise HAError("Smart home control unavailable: HASS_TOKEN not configured.")
+    def answerer():
+        for _ in range(200):
+            qf = [f for f in tmp_path.glob("*.json")
+                  if not f.name.endswith(".answer.json")]
+            if qf:
+                qid = qf[0].stem
+                (tmp_path / f"{qid}.answer.json").write_text(
+                    json.dumps({"answer": "Paris is the capital of France."})
+                )
+                return
+            threading.Event().wait(0.05)
+        raise AssertionError("question file never appeared")
 
-    monkeypatch.setattr(srv, "_ha", boom)
-    r = srv.ask("what is the capital of france")
-    _check_contract(r)
-    assert "in chat instead" in r.content[0].text
-
-
-def test_ask_returns_answer(monkeypatch):
-    srv = _unit_srv(monkeypatch, HASS_TOKEN="k")
-
-    class FakeHA:
-        def conversation(self, question):
-            return "Paris is the capital of France."
-
-    monkeypatch.setattr(srv, "_ha", lambda: FakeHA())
-    r = srv.ask("what is the capital of france")
+    t = threading.Thread(target=answerer, daemon=True)
+    t.start()
+    r = srv.ask_muse("what is the capital of france")
+    t.join(timeout=10)
     _check_contract(r)
     assert r.content[0].text == "Paris is the capital of France."
     assert (
         r.structuredContent["semanticResult"]["question"]
         == "what is the capital of france"
     )
+    # queue cleaned up
+    assert list(tmp_path.glob("*.json")) == []
+
+
+def test_ask_muse_timeout_is_graceful(monkeypatch, tmp_path):
+    srv = _unit_srv(monkeypatch)
+    monkeypatch.setattr(srv, "_QUEUE_DIR", tmp_path)
+    monkeypatch.setattr(srv, "_ASK_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(srv, "_ASK_POLL_S", 0.05)
+    r = srv.ask_muse("will anyone answer this")
+    _check_contract(r)
+    assert "didn't get an answer in time" in r.content[0].text
+    assert list(tmp_path.glob("*.json")) == []
+
+
+# ---------------------------------------------------------------- queue HTTP endpoints
+
+
+def _queue_client(app):
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://127.0.0.1:8765"
+    )
+
+
+def _queue_headers(token="sekret"):
+    return {"Authorization": f"Bearer {token}", "Host": "127.0.0.1:8765"}
+
+
+async def test_queue_pending_empty_returns_204(app_with_token, monkeypatch, tmp_path):
+    import pebble_index_mcp.server as srv
+
+    monkeypatch.setattr(srv, "_QUEUE_DIR", tmp_path)
+    async with _queue_client(app_with_token) as client:
+        r = await client.get("/queue/pending", headers=_queue_headers())
+    assert r.status_code == 204
+
+
+async def test_queue_pending_requires_auth(app_with_token, monkeypatch, tmp_path):
+    import pebble_index_mcp.server as srv
+
+    monkeypatch.setattr(srv, "_QUEUE_DIR", tmp_path)
+    async with _queue_client(app_with_token) as client:
+        r = await client.get("/queue/pending")
+        assert r.status_code == 401
+        r = await client.get("/queue/pending", headers=_queue_headers("wrong"))
+        assert r.status_code == 401
+        r = await client.post("/queue/answer", json={"id": "x", "answer": "y"})
+        assert r.status_code == 401
+
+
+async def test_queue_claim_answer_flow(app_with_token, monkeypatch, tmp_path):
+    """pending returns oldest question and claims it; answer stores the file."""
+    import pebble_index_mcp.server as srv
+
+    monkeypatch.setattr(srv, "_QUEUE_DIR", tmp_path)
+    qid = "a" * 32
+    (tmp_path / f"{qid}.json").write_text(
+        json.dumps({"id": qid, "question": "q?", "ts": "t"})
+    )
+    async with _queue_client(app_with_token) as client:
+        r = await client.get("/queue/pending", headers=_queue_headers())
+        assert r.status_code == 200
+        body = r.json()
+        assert body["id"] == qid
+        assert body["question"] == "q?"
+        # claimed: second poll finds nothing
+        assert (tmp_path / f"{qid}.claimed").exists()
+        r = await client.get("/queue/pending", headers=_queue_headers())
+        assert r.status_code == 204
+        # post the answer
+        r = await client.post(
+            "/queue/answer",
+            headers=_queue_headers(),
+            json={"id": qid, "answer": "the answer"},
+        )
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+    stored = json.loads((tmp_path / f"{qid}.answer.json").read_text())
+    assert stored["answer"] == "the answer"
+
+
+async def test_queue_answer_rejects_bad_input(app_with_token, monkeypatch, tmp_path):
+    import pebble_index_mcp.server as srv
+
+    monkeypatch.setattr(srv, "_QUEUE_DIR", tmp_path)
+    async with _queue_client(app_with_token) as client:
+        # path traversal attempt
+        r = await client.post(
+            "/queue/answer",
+            headers=_queue_headers(),
+            json={"id": "../../evil", "answer": "x"},
+        )
+        assert r.status_code == 400
+        # empty answer
+        r = await client.post(
+            "/queue/answer",
+            headers=_queue_headers(),
+            json={"id": "b" * 32, "answer": "  "},
+        )
+        assert r.status_code == 400
 
 
 async def test_prompts_list_arguments_null(app_with_token):

@@ -6,11 +6,13 @@ Runs on Todd's home network (Home Assistant box via Portainer/Docker),
 so the `ha` tool hits Home Assistant's local REST API directly.
 
 Tools:
-  ha   - Home Assistant via local REST API (HASS_TOKEN long-lived token).
-         Lights, switches, fans, climate (incl. setpoints), covers,
-         media players, sensor reads. Never locks or alarms.
-  wyze - On/off for Todd's two authorized Wyze lights ONLY.
-  ask  - Open-ended questions -> HA's own conversation agent.
+  ha       - Home Assistant via local REST API (HASS_TOKEN long-lived token).
+             Lights, switches, fans, climate (incl. setpoints), covers,
+             media players, sensor reads. Never locks or alarms.
+  wyze     - On/off for Todd's two authorized Wyze lights ONLY.
+  ask_muse - Open-ended questions -> Muse himself, via a file queue bridged
+             over HTTPS: GET /queue/pending and POST /queue/answer let an
+             off-box agent poll for questions and post answers back.
 
 Every user-facing answer goes through _spoken_response so the Pebble app's
 coreSchema contract surfaces the ANSWER (not the question) in the phone
@@ -19,10 +21,14 @@ notification.
 from __future__ import annotations
 
 import hmac
+import json
 import logging
 import os
 import re
 import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 
 import httpx
 
@@ -36,7 +42,9 @@ from mcp.types import (
     TextContent,
 )
 from mcp.types import Prompt as MCPPrompt
-from starlette.responses import JSONResponse
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Route
 
 from .homeassistant import HAClient, HAError
 
@@ -67,6 +75,14 @@ _WYZE_DECOYS = (
 
 # Voice from a ring has no voiceprint auth: never touch locks or alarms.
 _HA_DENY_WORDS = ("lock", "unlock", "alarm", "disarm")
+
+# ask_muse bridge: questions land as files in _QUEUE_DIR; an off-box agent
+# (Muse's cron) polls GET /queue/pending and posts answers to
+# POST /queue/answer. QUEUE_DIR is configurable for the Docker deployment.
+_QUEUE_DIR = Path(os.environ.get("QUEUE_DIR", "queue"))
+_ASK_TIMEOUT_S = 150
+_ASK_POLL_S = 5
+_QID_RE = re.compile(r"^[0-9a-f]{32}$")
 
 # DNS-rebinding protection: allow loopback plus any hosts named in
 # MCP_ALLOWED_HOSTS (comma-separated). The public DuckDNS hostname goes here.
@@ -267,22 +283,117 @@ def wyze(command: str) -> CallToolResult:
                                 question=command)
 
 
-# ---------------------------------------------------------------- ask
+# ---------------------------------------------------------------- ask_muse
+# (file-queue bridge to Muse, answered over HTTPS by an off-box agent)
+
 
 @mcp.tool()
-def ask(question: str) -> CallToolResult:
-    """Ask Home Assistant's conversation agent anything the ha and wyze tools
-    can't handle. Uses Todd's already-configured HA assistant. Keep the
-    question short; the answer comes back as a phone notification."""
+def ask_muse(question: str) -> CallToolResult:
+    """Ask Muse anything the ha and wyze tools can't handle — explanations,
+    advice, current information, math, opinions, anything needing Todd's
+    context or judgment. The question is handed to Muse himself and his
+    answer comes back as the phone notification. Keep the question short."""
+    _QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    qid = uuid.uuid4().hex
+    qfile = _QUEUE_DIR / f"{qid}.json"
+    afile = _QUEUE_DIR / f"{qid}.answer.json"
+    qfile.write_text(json.dumps({
+        "id": qid,
+        "question": question,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }))
     try:
-        answer = _ha().conversation(question)
-        return _spoken_response(answer, question=question)
-    except HAError as e:
-        logger.warning("ask via HA conversation failed: %s", e)
+        deadline = time.time() + _ASK_TIMEOUT_S
+        while time.time() < deadline:
+            if afile.exists():
+                try:
+                    answer = (json.loads(afile.read_text() or "{}")
+                              .get("answer", "").strip())
+                except (json.JSONDecodeError, OSError):
+                    answer = ""
+                if answer:
+                    return _spoken_response(answer, question=question)
+            time.sleep(_ASK_POLL_S)
         return _spoken_response(
-            "I couldn't get an answer from the house on that one — try asking me in chat instead.",
+            "I didn't get an answer in time — ask me in chat instead.",
             question=question,
         )
+    finally:
+        for f in (qfile, afile):
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+        # A stale claim marker is harmless, but keep the dir tidy.
+        try:
+            (_QUEUE_DIR / f"{qid}.claimed").unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------- queue HTTP endpoints
+# (same app as /mcp, same bearer auth — lets Muse's cron poll from off-box)
+
+
+def _queue_question_files():
+    """Yield (qid, path) for question files with no answer yet, oldest first."""
+    try:
+        files = sorted(
+            _QUEUE_DIR.glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+        )
+    except OSError:
+        return
+    for p in files:
+        name = p.name
+        if not name.endswith(".json") or ".answer." in name or ".claimed" in name:
+            continue
+        qid = name[: -len(".json")]
+        if not _QID_RE.match(qid):
+            continue
+        if (_QUEUE_DIR / f"{qid}.answer.json").exists():
+            continue
+        if (_QUEUE_DIR / f"{qid}.claimed").exists():
+            continue
+        yield qid, p
+
+
+async def queue_pending(request: Request) -> JSONResponse:
+    """Return the oldest unanswered, unclaimed question (and claim it)."""
+    for qid, p in _queue_question_files():
+        try:
+            payload = json.loads(p.read_text() or "{}")
+        except (json.JSONDecodeError, OSError):
+            continue
+        try:
+            (_QUEUE_DIR / f"{qid}.claimed").write_text(
+                datetime.now(timezone.utc).isoformat()
+            )
+        except OSError:
+            continue
+        return JSONResponse({"id": qid, **payload})
+    return Response(status_code=204)
+
+
+async def queue_answer(request: Request) -> JSONResponse:
+    """Accept {"id": ..., "answer": "..."} and store it for the waiting tool."""
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        return JSONResponse({"error": "invalid JSON"}, status_code=400)
+    qid = (body.get("id") or "").strip() if isinstance(body, dict) else ""
+    answer = (body.get("answer") or "").strip() if isinstance(body, dict) else ""
+    if not _QID_RE.match(qid):
+        return JSONResponse({"error": "bad id"}, status_code=400)
+    if not answer:
+        return JSONResponse({"error": "empty answer"}, status_code=400)
+    try:
+        (_QUEUE_DIR / f"{qid}.answer.json").write_text(
+            json.dumps({"answer": answer})
+        )
+    except OSError:
+        return JSONResponse({"error": "write failed"}, status_code=500)
+    return JSONResponse({"ok": True})
 
 
 # ---------------------------------------------------------------- persona prompt
@@ -295,8 +406,8 @@ _MUSE_PERSONA = (
     "media players, sensor reads. ALWAYS use this for home commands, never guess.\n"
     "- `wyze`: ONLY his two Wyze lights — \"Todd's light\" (bedroom) and \"Lamp\" "
     "(living room). Use for on/off of exactly these.\n"
-    "- `ask`: anything needing explanations, advice, current information, or "
-    "judgment — anything ha/wyze can't do.\n"
+    "- `ask_muse`: anything needing explanations, advice, current information, "
+    "or judgment — anything ha/wyze can't do.\n"
     "Rules:\n"
     "- Answer in at most 3 short sentences. No markdown. The answer appears as "
     "a phone notification.\n"
@@ -365,6 +476,9 @@ def make_app():
             "Set it before deploying."
         )
     inner = mcp.streamable_http_app()
+    # Queue bridge endpoints live on the same app (same bearer auth).
+    inner.routes.append(Route("/queue/pending", queue_pending, methods=["GET"]))
+    inner.routes.append(Route("/queue/answer", queue_answer, methods=["POST"]))
     expected = f"Bearer {TOKEN}"
 
     async def auth_app(scope, receive, send):
